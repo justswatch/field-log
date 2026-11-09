@@ -3,6 +3,7 @@
 
   const TABLE = 'habits_data';
   const THEME_KEY = 'field-log-theme';
+  const SKIP_KEY = 'field-log-skip-enabled';
 
   const SWATCHES = [
     '#e0a93b', '#b5482a', '#6b8f5c', '#4a7a8c',
@@ -47,6 +48,10 @@
     return !!sched[isoIndex(date)];
   }
 
+  // A skipped day = missed because of an unplanned event. It is treated like a
+  // non-scheduled day: it neither breaks a streak nor counts toward it.
+  function isSkipped(entry) { return !!(entry && entry.skipped); }
+
   function entryHas(habit, entry) {
     if (!entry) return false;
     return habit.mode === 'hours' ? Number(entry.value) > 0 : !!entry.value;
@@ -75,7 +80,7 @@
     const today = todayDate();
     const list = [];
     weeks.forEach(week => week.forEach(d => {
-      if (d <= today && isScheduled(habit, d)) list.push(d);
+      if (d <= today && isScheduled(habit, d) && !isSkipped(habit.entries[toKey(d)])) list.push(d);
     }));
     return list;
   }
@@ -151,8 +156,9 @@
     let total = 0, done = 0;
     habits.forEach(h => {
       if (isScheduled(h, date)) {
-        total++;
         const entry = h.entries[toKey(date)];
+        if (isSkipped(entry)) return;
+        total++;
         if (entryHas(h, entry)) done++;
       }
     });
@@ -229,6 +235,15 @@
     render();
   }
 
+  // ============ skip-button setting (per device, like the theme) ============
+  function skipEnabled() {
+    try { return localStorage.getItem(SKIP_KEY) !== 'off'; } catch (e) { return true; }
+  }
+  function setSkipEnabled(on) {
+    try { localStorage.setItem(SKIP_KEY, on ? 'on' : 'off'); } catch (e) {}
+    render();
+  }
+
   // ============ dom helper ============
   function el(tag, attrs, children) {
     const e = document.createElement(tag);
@@ -275,15 +290,18 @@
         if (isFuture) cls += ' future';
         if (!scheduled) cls += ' off-day';
         if (entry && entry.note) cls += ' has-note';
+        const skipped = isSkipped(entry);
+        if (skipped) cls += ' skipped';
         const titleParts = [key];
         if (!scheduled) titleParts.push('not scheduled');
-        if (entry) {
+        if (skipped) titleParts.push('skipped');
+        if (entry && !skipped) {
           if (habit.mode === 'hours' && entry.value) titleParts.push(entry.value + 'h');
           if (habit.mode === 'check' && entry.value) titleParts.push('done');
-          if (entry.note) titleParts.push('"' + entry.note + '"');
         }
+        if (entry && entry.note) titleParts.push('"' + entry.note + '"');
         const cell = el('div', { class: cls, title: titleParts.join(' — ') });
-        cell.style.background = scheduled ? cellColor(entry, habit) : '';
+        cell.style.background = (scheduled && !skipped) ? cellColor(entry, habit) : '';
         if (!isFuture && scheduled) cell.addEventListener('click', () => openEditEntry(habit.id, key));
         grid.appendChild(cell);
       });
@@ -354,9 +372,10 @@
       } else {
         keys.forEach(k => {
           const entry = habit.entries[k];
-          const valueText = habit.mode === 'hours'
-            ? (entry.value ? entry.value + 'h' : '—')
-            : (entry.value ? 'Done' : '—');
+          const valueText = isSkipped(entry) ? 'Skipped'
+            : habit.mode === 'hours'
+              ? (entry.value ? entry.value + 'h' : '—')
+              : (entry.value ? 'Done' : '—');
           const row = el('div', { class: 'journal-item' });
           row.appendChild(el('div', { class: 'journal-date', text: fromKey(k).toDateString() }));
           row.appendChild(el('div', { class: 'journal-value', text: valueText }));
@@ -404,9 +423,21 @@
     const todayKey = toKey(todayDate());
     const todayEntry = habit.entries[todayKey];
     const todayScheduled = isScheduled(habit, todayDate());
+    const todaySkipped = isSkipped(todayEntry);
+    const emptyValue = habit.mode === 'hours' ? 0 : false;
     const logWrap = el('div', { class: 'log-control' });
     if (!todayScheduled) {
       logWrap.appendChild(el('span', { class: 'rest-note', text: 'Not scheduled today' }));
+    } else if (todaySkipped) {
+      logWrap.appendChild(el('span', { class: 'rest-note', text: 'Skipped today' }));
+      logWrap.appendChild(el('button', {
+        class: 'btn', text: 'Undo skip',
+        onclick: () => {
+          if (todayEntry.note) habit.entries[todayKey] = { value: emptyValue, note: todayEntry.note };
+          else delete habit.entries[todayKey];
+          saveHabits(); render();
+        }
+      }));
     } else if (habit.mode === 'hours') {
       const input = el('input', { type: 'number', step: '0.25', min: '0', placeholder: 'hrs' });
       input.value = todayEntry ? todayEntry.value : '';
@@ -430,6 +461,16 @@
         saveHabits(); render();
       });
       logWrap.appendChild(btn);
+    }
+    if (todayScheduled && !todaySkipped && skipEnabled() && !entryHas(habit, todayEntry)) {
+      logWrap.appendChild(el('button', {
+        class: 'btn btn-ghost', text: 'Skip', title: 'Skip today (unplanned event)',
+        onclick: () => {
+          const existingNote = todayEntry ? todayEntry.note : '';
+          habit.entries[todayKey] = { value: emptyValue, note: existingNote, skipped: true };
+          saveHabits(); render();
+        }
+      }));
     }
     statsRow.appendChild(logWrap);
     card.appendChild(statsRow);
@@ -459,7 +500,7 @@
     const habit = habits.find(h => h.id === habitId);
     if (!habit) return;
     const existing = habit.entries[dateKey] || { value: '', note: '' };
-    modalState = { type: 'editEntry', habitId, dateKey, value: existing.value || '', note: existing.note || '' };
+    modalState = { type: 'editEntry', habitId, dateKey, value: existing.value || '', note: existing.note || '', skipped: !!existing.skipped };
     render();
   }
 
@@ -570,7 +611,25 @@
       const dateLabel = fromKey(modalState.dateKey).toDateString();
       modal.appendChild(el('h3', { text: habit.name + ' — ' + dateLabel }));
 
-      if (habit.mode === 'hours') {
+      if (skipEnabled() || modalState.skipped) {
+        const statusField = el('div', { class: 'field' });
+        statusField.appendChild(el('label', { text: 'Day status' }));
+        const statusChoice = el('div', { class: 'mode-choice' });
+        const logBtn = el('button', { class: !modalState.skipped ? 'active' : '', text: 'Log it', type: 'button' });
+        const skipBtn = el('button', { class: modalState.skipped ? 'active' : '', text: 'Skip day', type: 'button' });
+        logBtn.addEventListener('click', () => { modalState.skipped = false; render(); });
+        skipBtn.addEventListener('click', () => { modalState.skipped = true; render(); });
+        statusChoice.appendChild(logBtn); statusChoice.appendChild(skipBtn);
+        statusField.appendChild(statusChoice);
+        modal.appendChild(statusField);
+      }
+
+      if (modalState.skipped) {
+        modal.appendChild(el('p', {
+          text: 'Skipped days (unplanned events) won\'t break your streak or count toward it.',
+          style: 'color:var(--ink-dim);font-size:12px;line-height:1.6;margin:0 0 14px;'
+        }));
+      } else if (habit.mode === 'hours') {
         const field = el('div', { class: 'field' });
         field.appendChild(el('label', { text: 'Hours logged' }));
         const input = el('input', { type: 'number', step: '0.25', min: '0' });
@@ -612,7 +671,9 @@
       modalActions.appendChild(el('button', {
         class: 'btn btn-accent', text: 'Save', onclick: () => {
           const note = (modalState.note || '').trim();
-          if (habit.mode === 'hours') {
+          if (modalState.skipped) {
+            habit.entries[modalState.dateKey] = { value: habit.mode === 'hours' ? 0 : false, note, skipped: true };
+          } else if (habit.mode === 'hours') {
             const v = parseFloat(modalState.value);
             if (!isNaN(v) && v > 0) habit.entries[modalState.dateKey] = { value: v, note };
             else if (note) habit.entries[modalState.dateKey] = { value: 0, note };
@@ -697,11 +758,28 @@
     wrap.appendChild(card);
   }
 
-  function renderSettingsView(wrap) {
-    const card = el('div', { class: 'card animate-in' });
+  // Settings are grouped into categories; each category is its own card.
+  function settingsCategory(title) {
+    const card = el('div', { class: 'card settings-cat animate-in' });
+    card.appendChild(el('div', { class: 'settings-cat-title', text: title }));
+    return card;
+  }
 
+  function settingRow(title, desc, control) {
+    const row = el('div', { class: 'setting-row' });
+    const text = el('div', { class: 'setting-text' });
+    text.appendChild(el('h3', { text: title }));
+    if (desc) text.appendChild(el('p', { text: desc }));
+    row.appendChild(text);
+    if (control) row.appendChild(control);
+    return row;
+  }
+
+  function renderSettingsView(wrap) {
+    // --- Appearance ---
+    const appearance = settingsCategory('Appearance');
     const themeBlock = el('div', { class: 'settings-block' });
-    themeBlock.appendChild(el('h3', { text: 'Appearance' }));
+    themeBlock.appendChild(el('h3', { text: 'Theme' }));
     themeBlock.appendChild(el('p', { text: 'Choose how Field Log looks on this device.' }));
     const choice = el('div', { class: 'theme-choice' });
     const pref = getThemePref();
@@ -712,31 +790,46 @@
       choice.appendChild(btn);
     });
     themeBlock.appendChild(choice);
-    card.appendChild(themeBlock);
+    appearance.appendChild(themeBlock);
+    wrap.appendChild(appearance);
 
-    card.appendChild(el('div', { class: 'divider' }));
+    // --- Tracking ---
+    const tracking = settingsCategory('Tracking');
+    const on = skipEnabled();
+    const sw = el('button', {
+      class: 'switch' + (on ? ' on' : ''), type: 'button',
+      role: 'switch', 'aria-checked': String(on), 'aria-label': 'Skip button',
+      onclick: () => setSkipEnabled(!on)
+    }, [el('span', { class: 'knob' })]);
+    tracking.appendChild(settingRow(
+      'Skip button',
+      'Show a Skip option for days you miss because of unplanned events. Skipped days don\'t break your streak or count toward it. Days you already skipped stay skipped if you turn this off.',
+      sw
+    ));
+    wrap.appendChild(tracking);
 
+    // --- Account ---
+    const account = settingsCategory('Account');
     const accountBlock = el('div', { class: 'settings-block' });
-    accountBlock.appendChild(el('h3', { text: 'Account' }));
+    accountBlock.appendChild(el('h3', { text: 'Signed in' }));
     accountBlock.appendChild(el('p', { text: session ? ('Signed in as ' + session.user.email) : '' }));
-    const signOutBtn = el('button', {
+    accountBlock.appendChild(el('button', {
       class: 'btn', text: 'Sign out',
       onclick: async () => { await sb.auth.signOut(); }
-    });
-    accountBlock.appendChild(signOutBtn);
-    card.appendChild(accountBlock);
+    }));
+    account.appendChild(accountBlock);
+    wrap.appendChild(account);
 
-    card.appendChild(el('div', { class: 'divider' }));
-
+    // --- Data ---
+    const data = settingsCategory('Data');
     const dangerBlock = el('div', { class: 'settings-block' });
-    dangerBlock.appendChild(el('h3', { text: 'Delete account', style: 'color:var(--bad);' }));
+    dangerBlock.appendChild(el('h3', { text: 'Delete all my data', style: 'color:var(--bad);' }));
     dangerBlock.appendChild(el('p', {
       text: 'Permanently deletes all your habits and entries from the database, then signs you out. To also remove your email/login itself, remove yourself from Authentication → Users in your Supabase project dashboard.'
     }));
     dangerBlock.appendChild(el('button', { class: 'btn btn-danger', text: 'Delete all my data', onclick: deleteAllData }));
-    card.appendChild(dangerBlock);
-
-    wrap.appendChild(card);
+    data.appendChild(dangerBlock);
+    wrap.appendChild(data);
   }
 
   function renderConfigMissing() {
@@ -787,7 +880,7 @@
         const email = (emailInput.value || '').trim();
         if (!email) { emailInput.focus(); return; }
         sendBtn.textContent = 'Sending…';
-        const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
+        const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin + window.location.pathname } });
         authNotice = error ? ('Error: ' + error.message) : 'Check your email for the sign-in link.';
         renderLogin();
       }
@@ -836,6 +929,17 @@
   async function boot() {
     applyTheme(getThemePref());
     if (!configReady()) { render(); return; }
+
+    // Show auth errors carried in the URL (e.g. an expired link) and clear the
+    // fragment, so a stale '#error=...' can never be reused as a redirect target.
+    const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    if (hashParams.get('error_code') || hashParams.get('error')) {
+      authNotice = hashParams.get('error_code') === 'otp_expired'
+        ? 'That sign-in link expired or was already used. Request a new one and open it right away.'
+        : 'Sign-in error: ' + (hashParams.get('error_description') || hashParams.get('error'));
+      history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+
     if (!sb) sb = supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
 
     if (window.matchMedia) {
@@ -865,7 +969,7 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       toKey, fromKey, todayDate, addDays, mondayOf, isoIndex,
-      isScheduled, entryHas, buildWeeks, scheduledDatesInWeeks,
+      isScheduled, isSkipped, entryHas, buildWeeks, scheduledDatesInWeeks,
       computeStreaks, dayScore, migrateHabits,
       __setHabits: (h) => { habits = h; },
     };
